@@ -1,0 +1,57 @@
+name: Build and Sign Release
+
+on:
+  release:
+    types: [created, published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g., v1.0.0)'
+        required: false
+        default: 'manual'
+
+jobs:
+  build-and-sign:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+        
+    - name: Get dependencies
+      run: go mod download
+      
+    - name: Build executable
+      run: go build -v -o scrcpy-manager.exe
+      
+    - name: Submit to SignPath for signing
+      uses: signpath/github-action-submit-signing-request@v1
+      with:
+        api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+        organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+        project-slug: 'ScrcpyManager'
+        signing-policy-slug: 'release-signing'
+        artifact-configuration-slug: 'default'
+        input-artifact-path: 'scrcpy-manager.exe'
+        output-artifact-path: 'scrcpy-manager-signed.exe'
+        wait-for-completion: true
+        
+    - name: Upload signed executable as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: scrcpy-manager-signed
+        path: scrcpy-manager-signed.exe
+        retention-days: 90
+        
+    - name: Upload signed executable to release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: scrcpy-manager-signed.exe
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
