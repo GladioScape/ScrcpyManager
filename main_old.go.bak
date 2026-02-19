@@ -1,0 +1,938 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"image/color"
+	"os/exec"
+	"sort"
+	"strings"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+)
+
+var (
+	mainWindow      fyne.Window
+	selectedDevice  *Device
+	deviceList      *widget.List
+	appGrid         *fyne.Container
+	runningAppsList *widget.List
+	statusLabel     *widget.Label
+
+	appSearchEntry   *widget.Entry
+	viewModeSelect   *widget.Select
+	showPackageCheck *widget.Check
+	showAppSizeCheck *widget.Check
+
+	// "Select a device" overlay label – hidden once a device is picked
+	noSelectionLabel *widget.Label
+
+	// Scroll container for apps – used to scroll to top on search
+	appScrollContainer *container.Scroll
+
+	// Current sort mode for apps
+	appSortMode string // "name", "name-desc", "size", "size-desc"
+
+	devices     []*Device
+	apps        []*AndroidApp
+	runningApps []*RunningApp
+)
+
+func main() {
+	// Load configuration
+	err := LoadConfig()
+	if err != nil {
+		fmt.Printf("Warning: Failed to load config: %v\n", err)
+		fmt.Println("Using default configuration")
+	}
+
+	if appSortMode == "" {
+		appSortMode = "name"
+	}
+
+	// Create Fyne app
+	myApp := app.New()
+	myApp.Settings().SetTheme(theme.DarkTheme())
+
+	mainWindow = myApp.NewWindow("Scrcpy Link")
+	mainWindow.Resize(fyne.NewSize(900, 700))
+
+	// Initialize UI
+	content := buildUI()
+	mainWindow.SetContent(content)
+
+	// Start device monitoring
+	deviceManager.StartMonitoring()
+
+	// Add listeners
+	deviceManager.AddListener(onDevicesChanged)
+	appLauncher.AddListener(onRunningAppsChanged)
+
+	// Initial device scan
+	devices = deviceManager.GetDevices()
+	deviceList.Refresh()
+
+	// Show window and run
+	mainWindow.ShowAndRun()
+
+	// Cleanup on exit
+	deviceManager.StopMonitoring()
+	appLauncher.StopAllApps()
+}
+
+func buildUI() fyne.CanvasObject {
+	// Create tabs for different sections
+	deviceTab := makeDeviceTab()
+	appsTab := makeAppsTab()
+	runningTab := makeRunningAppsTab()
+	settingsTab := makeSettingsTab()
+
+	tabs := container.NewAppTabs(
+		container.NewTabItem("Devices", deviceTab),
+		container.NewTabItem("Apps", appsTab),
+		container.NewTabItem("Running", runningTab),
+		container.NewTabItem("Settings", settingsTab),
+	)
+
+	// Status bar at bottom
+	statusLabel = widget.NewLabel("Ready")
+	statusLabel.TextStyle = fyne.TextStyle{Italic: true}
+
+	statusBar := container.NewBorder(
+		nil, nil, nil, nil,
+		container.NewPadded(statusLabel),
+	)
+
+	// Main layout
+	return container.NewBorder(
+		nil,       // top
+		statusBar, // bottom
+		nil, nil,  // left, right
+		tabs, // center
+	)
+}
+
+func makeDeviceTab() fyne.CanvasObject {
+	// Device list
+	deviceList = widget.NewList(
+		func() int {
+			return len(devices)
+		},
+		func() fyne.CanvasObject {
+			icon := widget.NewIcon(theme.ComputerIcon())
+			label := widget.NewLabel("Device")
+			label.TextStyle = fyne.TextStyle{Bold: true}
+			serialLabel := widget.NewLabel("Serial")
+			serialLabel.TextStyle = fyne.TextStyle{Monospace: true}
+
+			return container.NewBorder(
+				nil, nil,
+				icon,
+				nil,
+				container.NewVBox(label, serialLabel),
+			)
+		},
+		func(id widget.ListItemID, item fyne.CanvasObject) {
+			if id >= len(devices) {
+				return
+			}
+			dev := devices[id]
+
+			border := item.(*fyne.Container)
+			vbox := border.Objects[0].(*fyne.Container)
+
+			nameLabel := vbox.Objects[0].(*widget.Label)
+			serialLabel := vbox.Objects[1].(*widget.Label)
+
+			nameLabel.SetText(dev.Model)
+			serialLabel.SetText(dev.Serial)
+		},
+	)
+
+	deviceList.OnSelected = func(id widget.ListItemID) {
+		if id < len(devices) {
+			selectedDevice = devices[id]
+			updateStatus(fmt.Sprintf("Selected: %s", selectedDevice.Model))
+			// Hide the "no selection" label in Apps tab
+			if noSelectionLabel != nil {
+				noSelectionLabel.Hide()
+			}
+			loadAppsForDevice(selectedDevice)
+		}
+	}
+
+	// Refresh button
+	refreshBtn := widget.NewButton("Refresh Devices", func() {
+		deviceManager.scanDevices()
+		devices = deviceManager.GetDevices()
+		deviceList.Refresh()
+		updateStatus("Devices refreshed")
+	})
+
+	openScreenBtn := widget.NewButton("Open Phone Screen", func() {
+		if selectedDevice == nil {
+			updateStatus("No device selected")
+			return
+		}
+		if err := appLauncher.LaunchScreen(selectedDevice.Serial); err != nil {
+			updateStatus(fmt.Sprintf("Error launching screen: %v", err))
+		} else {
+			updateStatus("Phone screen launched")
+		}
+	})
+
+	header := widget.NewLabelWithStyle("Connected Devices", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+
+	return container.NewBorder(
+		container.NewVBox(header, container.NewHBox(refreshBtn, openScreenBtn)),
+		nil, nil, nil,
+		container.NewPadded(deviceList),
+	)
+}
+
+func makeAppsTab() fyne.CanvasObject {
+	// Search entry (hidden by default)
+	appSearchEntry = widget.NewEntry()
+	appSearchEntry.SetPlaceHolder("Search apps...")
+	appSearchEntry.OnChanged = func(s string) {
+		updateAppGrid()
+		// Scroll to top when search text changes
+		if appScrollContainer != nil {
+			appScrollContainer.ScrollToTop()
+		}
+	}
+	appSearchEntry.Hide()
+
+	// Hidden select for tracking view mode (not displayed)
+	viewModeSelect = widget.NewSelect([]string{"icons", "grid", "list"}, func(v string) {})
+	if globalConfig.AppViewMode == "" {
+		globalConfig.AppViewMode = "icons"
+	}
+	viewModeSelect.SetSelected(globalConfig.AppViewMode)
+
+	// Checkboxes for filter popup
+	showPackageCheck = widget.NewCheck("Package name", func(b bool) {
+		globalConfig.ShowPackageName = b
+		updateAppGrid()
+	})
+	showPackageCheck.Checked = globalConfig.ShowPackageName
+
+	showAppSizeCheck = widget.NewCheck("App size (slower)", func(b bool) {
+		globalConfig.ShowAppSize = b
+		if selectedDevice != nil {
+			go func() {
+				appDetector.RefreshApps(selectedDevice.Serial)
+				loadAppsForDevice(selectedDevice)
+			}()
+		} else {
+			updateAppGrid()
+		}
+	})
+	showAppSizeCheck.Checked = globalConfig.ShowAppSize
+
+	// --- Icon buttons for toolbar ---
+
+	// 1. Search icon (toggle search bar)
+	searchBtn := widget.NewButtonWithIcon("", theme.SearchIcon(), func() {
+		if appSearchEntry.Hidden {
+			appSearchEntry.Show()
+		} else {
+			appSearchEntry.Hide()
+			appSearchEntry.SetText("")
+			updateAppGrid()
+		}
+	})
+
+	// 2. Refresh icon
+	refreshBtn := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() {
+		if selectedDevice != nil {
+			// Force refresh (clear cache)
+			go func() {
+				appDetector.RefreshApps(selectedDevice.Serial)
+				loadAppsForDevice(selectedDevice)
+			}()
+		}
+	})
+
+	// 3. View mode icon (dropdown popup)
+	viewBtn := widget.NewButtonWithIcon("", theme.ListIcon(), nil)
+	viewMenu := fyne.NewMenu("",
+		fyne.NewMenuItem("Icons", func() { globalConfig.AppViewMode = "icons"; updateAppGrid() }),
+		fyne.NewMenuItem("Grid", func() { globalConfig.AppViewMode = "grid"; updateAppGrid() }),
+		fyne.NewMenuItem("List", func() { globalConfig.AppViewMode = "list"; updateAppGrid() }),
+	)
+	viewBtn.OnTapped = func() {
+		pop := widget.NewPopUpMenu(viewMenu, mainWindow.Canvas())
+		pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(viewBtn)
+		pop.ShowAtPosition(fyne.NewPos(pos.X, pos.Y+viewBtn.Size().Height))
+	}
+
+	// 4. Sort icon (dropdown popup with sort options)
+	sortBtn := widget.NewButtonWithIcon("", theme.MenuDropUpIcon(), nil)
+	sortBtn.OnTapped = func() {
+		sortMenu := fyne.NewMenu("",
+			fyne.NewMenuItem("Name A→Z", func() { appSortMode = "name"; updateAppGrid() }),
+			fyne.NewMenuItem("Name Z→A", func() { appSortMode = "name-desc"; updateAppGrid() }),
+			fyne.NewMenuItem("Size ↑", func() { appSortMode = "size"; updateAppGrid() }),
+			fyne.NewMenuItem("Size ↓", func() { appSortMode = "size-desc"; updateAppGrid() }),
+		)
+		pop := widget.NewPopUpMenu(sortMenu, mainWindow.Canvas())
+		pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(sortBtn)
+		pop.ShowAtPosition(fyne.NewPos(pos.X, pos.Y+sortBtn.Size().Height))
+	}
+
+	// 5. Filter icon (dropdown popup with checkboxes)
+	filterBtn := widget.NewButtonWithIcon("", theme.SettingsIcon(), nil)
+	filterBtn.OnTapped = func() {
+		content := container.NewVBox(showPackageCheck, showAppSizeCheck)
+		pop := widget.NewPopUp(content, mainWindow.Canvas())
+		pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(filterBtn)
+		pop.ShowAtPosition(fyne.NewPos(pos.X, pos.Y+filterBtn.Size().Height))
+	}
+
+	// Toolbar row: search, refresh, view mode, sort, filter
+	toolbarRow := container.NewHBox(searchBtn, refreshBtn, viewBtn, sortBtn, filterBtn)
+
+	// App grid area
+	appGrid = container.NewMax()
+
+	appScrollContainer = container.NewVScroll(appGrid)
+	appScrollContainer.SetMinSize(fyne.NewSize(400, 500))
+
+	noSelectionLabel = widget.NewLabel("Select a device from the Devices tab to see its apps")
+	noSelectionLabel.Alignment = fyne.TextAlignCenter
+	noSelectionLabel.TextStyle = fyne.TextStyle{Italic: true}
+	// If a device is already selected, hide the label immediately
+	if selectedDevice != nil {
+		noSelectionLabel.Hide()
+	}
+
+	return container.NewBorder(
+		container.NewVBox(toolbarRow, appSearchEntry),
+		nil, nil, nil,
+		container.NewStack(
+			appScrollContainer,
+			container.NewCenter(noSelectionLabel),
+		),
+	)
+}
+
+func makeRunningAppsTab() fyne.CanvasObject {
+	runningAppsList = widget.NewList(
+		func() int {
+			return len(runningApps)
+		},
+		func() fyne.CanvasObject {
+			nameLabel := widget.NewLabel("App Name")
+			nameLabel.TextStyle = fyne.TextStyle{Bold: true}
+			deviceLabel := widget.NewLabel("Device")
+			stopBtn := widget.NewButton("Stop", nil)
+			stopBtn.Importance = widget.DangerImportance
+
+			return container.NewBorder(
+				nil, nil, nil,
+				stopBtn,
+				container.NewVBox(nameLabel, deviceLabel),
+			)
+		},
+		func(id widget.ListItemID, item fyne.CanvasObject) {
+			if id >= len(runningApps) {
+				return
+			}
+			app := runningApps[id]
+
+			border := item.(*fyne.Container)
+			vbox := border.Objects[0].(*fyne.Container)
+			stopBtn := border.Objects[1].(*widget.Button)
+
+			nameLabel := vbox.Objects[0].(*widget.Label)
+			deviceLabel := vbox.Objects[1].(*widget.Label)
+
+			nameLabel.SetText(app.AppName)
+			deviceLabel.SetText(fmt.Sprintf("Device: %s", app.Serial))
+
+			stopBtn.OnTapped = func() {
+				appLauncher.StopApp(app.Serial, app.PackageName)
+			}
+		},
+	)
+
+	stopAllBtn := widget.NewButton("Stop All", func() {
+		appLauncher.StopAllApps()
+		updateStatus("All apps stopped")
+	})
+	stopAllBtn.Importance = widget.DangerImportance
+
+	return container.NewBorder(
+		container.NewVBox(stopAllBtn),
+		nil, nil, nil,
+		container.NewPadded(runningAppsList),
+	)
+}
+
+func makeSettingsTab() fyne.CanvasObject {
+	// --- Display Selection ---
+	// Display dropdown shows "Display N (WxH)" so resolution is visible in the dropdown itself
+	displaySelect := widget.NewSelect([]string{
+		fmt.Sprintf("Default (%dx%d)", globalConfig.DefaultDisplayWidth, globalConfig.DefaultDisplayHeight),
+	}, nil)
+	displaySelect.SetSelected(displaySelect.Options[0])
+
+	// Track display ID mapping: option label -> display id
+	displayIDMap := map[string]int{
+		displaySelect.Options[0]: 0,
+	}
+
+	displaySelect.OnChanged = func(selected string) {
+		// Parse resolution from the label "Display N (WxH)" or "Default (WxH)"
+		if idx := strings.Index(selected, "("); idx >= 0 {
+			res := strings.TrimSuffix(selected[idx+1:], ")")
+			var w, h int
+			if _, err := fmt.Sscanf(res, "%dx%d", &w, &h); err == nil && w > 0 && h > 0 {
+				globalConfig.DefaultDisplayWidth = w
+				globalConfig.DefaultDisplayHeight = h
+			}
+		}
+		if id, ok := displayIDMap[selected]; ok {
+			globalConfig.TargetDisplayID = id
+		}
+	}
+
+	// Refresh displays button – queries device for all physical displays
+	refreshDisplaysBtn := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() {
+		if selectedDevice == nil {
+			updateStatus("Select a device first")
+			return
+		}
+		go func() {
+			displays := getDeviceDisplays(selectedDevice.Serial)
+			fyne.Do(func() {
+				// Clear and rebuild
+				for k := range displayIDMap {
+					delete(displayIDMap, k)
+				}
+				opts := make([]string, 0, len(displays))
+				for _, d := range displays {
+					opts = append(opts, d.Label)
+					displayIDMap[d.Label] = d.ID
+				}
+				if len(opts) == 0 {
+					def := fmt.Sprintf("Default (%dx%d)", globalConfig.DefaultDisplayWidth, globalConfig.DefaultDisplayHeight)
+					opts = []string{def}
+					displayIDMap[def] = 0
+				}
+				displaySelect.Options = opts
+				displaySelect.Refresh()
+				displaySelect.SetSelected(opts[0])
+				updateStatus(fmt.Sprintf("Found %d display(s)", len(opts)))
+			})
+		}()
+	})
+
+	// --- Buffer / Quality ---
+	bufferOptions := []string{"Performance (2 Mbps)", "Balanced (8 Mbps)", "Quality (20 Mbps)", "Max (50 Mbps)"}
+	bufferValues := map[string]int{
+		"Performance (2 Mbps)": 2000000,
+		"Balanced (8 Mbps)":    8000000,
+		"Quality (20 Mbps)":    20000000,
+		"Max (50 Mbps)":        50000000,
+	}
+	currentBuffer := "Balanced (8 Mbps)"
+	for label, val := range bufferValues {
+		if val == globalConfig.ScrcpyBitrate {
+			currentBuffer = label
+			break
+		}
+	}
+	bufferSelect := widget.NewSelect(bufferOptions, func(selected string) {
+		if val, ok := bufferValues[selected]; ok {
+			globalConfig.ScrcpyBitrate = val
+		}
+	})
+	bufferSelect.SetSelected(currentBuffer)
+
+	// --- Max FPS ---
+	fpsEntry := widget.NewEntry()
+	fpsEntry.SetText(fmt.Sprintf("%d", globalConfig.ScrcpyMaxFPS))
+
+	// --- Other options ---
+	stayAwakeCheck := widget.NewCheck("Keep device awake", func(checked bool) {
+		globalConfig.StayAwake = checked
+	})
+	stayAwakeCheck.Checked = globalConfig.StayAwake
+
+	turnScreenOffCheck := widget.NewCheck("Turn screen off", func(checked bool) {
+		globalConfig.TurnScreenOff = checked
+	})
+	turnScreenOffCheck.Checked = globalConfig.TurnScreenOff
+
+	disableAudioCheck := widget.NewCheck("Disable audio", func(checked bool) {
+		globalConfig.DisableAudio = checked
+	})
+	disableAudioCheck.Checked = globalConfig.DisableAudio
+
+	alwaysOnTopCheck := widget.NewCheck("Always on top", func(checked bool) {
+		globalConfig.AlwaysOnTop = checked
+	})
+	alwaysOnTopCheck.Checked = globalConfig.AlwaysOnTop
+
+	borderlessCheck := widget.NewCheck("Borderless windows", func(checked bool) {
+		globalConfig.Borderless = checked
+	})
+	borderlessCheck.Checked = globalConfig.Borderless
+
+	extraArgsEntry := widget.NewEntry()
+	extraArgsEntry.SetPlaceHolder("Custom scrcpy arguments")
+	extraArgsEntry.SetText(globalConfig.ExtraScrcpyArgs)
+
+	// Save button
+	saveBtn := widget.NewButton("Save Settings", func() {
+		fmt.Sscanf(fpsEntry.Text, "%d", &globalConfig.ScrcpyMaxFPS)
+		globalConfig.ExtraScrcpyArgs = extraArgsEntry.Text
+
+		err := SaveConfig()
+		if err != nil {
+			updateStatus(fmt.Sprintf("Error saving config: %v", err))
+		} else {
+			updateStatus("Settings saved successfully")
+		}
+	})
+	saveBtn.Importance = widget.HighImportance
+
+	form := widget.NewForm(
+		widget.NewFormItem("Display", container.NewBorder(nil, nil, nil, refreshDisplaysBtn, displaySelect)),
+		widget.NewFormItem("Video Quality", bufferSelect),
+		widget.NewFormItem("Max FPS", fpsEntry),
+		widget.NewFormItem("", stayAwakeCheck),
+		widget.NewFormItem("", turnScreenOffCheck),
+		widget.NewFormItem("", disableAudioCheck),
+		widget.NewFormItem("", alwaysOnTopCheck),
+		widget.NewFormItem("", borderlessCheck),
+		widget.NewFormItem("Extra Arguments", extraArgsEntry),
+	)
+
+	header := widget.NewLabelWithStyle("Application Settings", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+
+	return container.NewBorder(
+		container.NewVBox(header, widget.NewSeparator()),
+		container.NewPadded(saveBtn),
+		nil, nil,
+		container.NewVScroll(form),
+	)
+}
+
+// displayInfo holds parsed display information
+type displayInfo struct {
+	ID    int
+	Label string // e.g. "Display 0 (1080x2400)"
+}
+
+// getDeviceDisplays queries the device for available displays and their resolutions.
+// It uses multiple approaches to ensure all displays are found.
+func getDeviceDisplays(serial string) []displayInfo {
+	displays := make([]displayInfo, 0)
+	seen := make(map[int]bool)
+
+	// Approach 1: Parse "dumpsys display" for mBaseDisplayInfo lines
+	cmd := exec.Command(globalConfig.ADBPath, "-s", serial, "shell", "dumpsys", "display")
+	output, err := cmd.Output()
+	if err == nil {
+		scanner := bufio.NewScanner(strings.NewReader(string(output)))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+
+			// Match lines like: mBaseDisplayInfo=DisplayInfo{... , displayId 0, ... real 1080 x 2400 ...}
+			if strings.Contains(line, "mBaseDisplayInfo=DisplayInfo") {
+				displayID := -1
+				w, h := 0, 0
+
+				// Try to extract displayId
+				if idx := strings.Index(line, "displayId "); idx >= 0 {
+					fmt.Sscanf(line[idx:], "displayId %d", &displayID)
+				}
+				// Also try #N format: DisplayInfo{"...", displayId N}
+				if displayID < 0 {
+					if idx := strings.Index(line, "displayId="); idx >= 0 {
+						fmt.Sscanf(line[idx:], "displayId=%d", &displayID)
+					}
+				}
+
+				// Extract resolution
+				if idx := strings.Index(line, "real "); idx >= 0 {
+					fmt.Sscanf(line[idx+5:], "%d x %d", &w, &h)
+				}
+
+				if displayID < 0 {
+					displayID = len(displays)
+				}
+
+				if w > 0 && h > 0 && !seen[displayID] {
+					seen[displayID] = true
+					displays = append(displays, displayInfo{
+						ID:    displayID,
+						Label: fmt.Sprintf("Display %d (%dx%d)", displayID, w, h),
+					})
+				}
+			}
+		}
+	}
+
+	// Approach 2: Parse "dumpsys SurfaceFlinger --display-id" for additional displays
+	cmd2 := exec.Command(globalConfig.ADBPath, "-s", serial, "shell", "dumpsys", "SurfaceFlinger", "--display-id")
+	if out2, err2 := cmd2.Output(); err2 == nil {
+		scanner := bufio.NewScanner(strings.NewReader(string(out2)))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			// Lines may contain display IDs and info
+			_ = line // parse if needed
+		}
+	}
+
+	// Approach 3: If we found nothing, try "wm size" for the default display
+	if len(displays) == 0 {
+		cmd3 := exec.Command(globalConfig.ADBPath, "-s", serial, "shell", "wm", "size")
+		if out3, err3 := cmd3.Output(); err3 == nil {
+			outStr := strings.TrimSpace(string(out3))
+			// Output: "Physical size: 1080x2400"
+			if idx := strings.Index(outStr, ": "); idx >= 0 {
+				var w, h int
+				if _, err := fmt.Sscanf(outStr[idx+2:], "%dx%d", &w, &h); err == nil && w > 0 && h > 0 {
+					displays = append(displays, displayInfo{
+						ID:    0,
+						Label: fmt.Sprintf("Display 0 (%dx%d)", w, h),
+					})
+				}
+			}
+		}
+	}
+
+	// Fallback: use config defaults
+	if len(displays) == 0 {
+		displays = append(displays, displayInfo{
+			ID:    0,
+			Label: fmt.Sprintf("Display 0 (%dx%d)", globalConfig.DefaultDisplayWidth, globalConfig.DefaultDisplayHeight),
+		})
+	}
+
+	// Sort by display ID
+	sort.Slice(displays, func(i, j int) bool {
+		return displays[i].ID < displays[j].ID
+	})
+
+	return displays
+}
+
+func loadAppsForDevice(dev *Device) {
+	updateStatus(fmt.Sprintf("Loading apps for %s...", dev.Model))
+
+	// Hide "no selection" label
+	if noSelectionLabel != nil {
+		fyne.Do(func() {
+			noSelectionLabel.Hide()
+		})
+	}
+
+	// Load apps in background
+	go func() {
+		detectedApps, err := appDetector.GetAppsForDevice(dev.Serial)
+		if err != nil {
+			updateStatus(fmt.Sprintf("Error loading apps: %v", err))
+			return
+		}
+
+		// Store apps
+		apps = detectedApps
+
+		// Schedule UI update on main thread
+		fyne.Do(func() {
+			updateAppGrid()
+			updateStatus(fmt.Sprintf("Loaded %d apps for %s", len(apps), dev.Model))
+		})
+
+		// Always compute sizes in background for sort-by-size support
+		if selectedDevice != nil {
+			lazyComputeSizes(dev.Serial, detectedApps, 200)
+		}
+	}()
+}
+
+func sortApps(list []*AndroidApp) {
+	switch appSortMode {
+	case "name":
+		sort.Slice(list, func(i, j int) bool {
+			return strings.ToLower(list[i].AppName) < strings.ToLower(list[j].AppName)
+		})
+	case "name-desc":
+		sort.Slice(list, func(i, j int) bool {
+			return strings.ToLower(list[i].AppName) > strings.ToLower(list[j].AppName)
+		})
+	case "size":
+		sort.Slice(list, func(i, j int) bool {
+			return list[i].SizeKB < list[j].SizeKB
+		})
+	case "size-desc":
+		sort.Slice(list, func(i, j int) bool {
+			return list[i].SizeKB > list[j].SizeKB
+		})
+	default:
+		sort.Slice(list, func(i, j int) bool {
+			return strings.ToLower(list[i].AppName) < strings.ToLower(list[j].AppName)
+		})
+	}
+}
+
+func updateAppGrid() {
+	if appGrid == nil {
+		return
+	}
+	appGrid.Objects = nil
+
+	if len(apps) == 0 {
+		label := widget.NewLabel("No launchable apps found")
+		label.Alignment = fyne.TextAlignCenter
+		appGrid.Add(label)
+		appGrid.Refresh()
+		return
+	}
+
+	filtered := filterApps(apps, appSearchEntry.Text, nil)
+
+	// Apply sorting
+	sortApps(filtered)
+
+	maxApps := len(filtered)
+	if maxApps > 200 {
+		maxApps = 200
+	}
+	filtered = filtered[:maxApps]
+
+	switch globalConfig.AppViewMode {
+	case "list":
+		vbox := container.NewVBox()
+		for _, a := range filtered {
+			vbox.Add(makeAppCard(a))
+		}
+		appGrid.Add(vbox)
+	case "grid":
+		cols := globalConfig.AppGridColumns
+		if cols <= 0 {
+			cols = 6
+		}
+		grid := container.NewGridWithColumns(cols)
+		for _, a := range filtered {
+			grid.Add(makeCompactCard(a))
+		}
+		appGrid.Add(grid)
+	default: // icons
+		itemSize := fyne.NewSize(140, 60)
+		iconGrid := container.NewGridWrap(itemSize)
+		for _, a := range filtered {
+			iconGrid.Add(makeIconItem(a))
+		}
+		appGrid.Add(iconGrid)
+	}
+
+	appGrid.Refresh()
+
+	// Scroll to top after updating
+	if appScrollContainer != nil {
+		appScrollContainer.ScrollToTop()
+	}
+}
+
+func formatSize(sizeKB int) string {
+	if sizeKB <= 0 {
+		return ""
+	}
+	if sizeKB < 1024 {
+		return fmt.Sprintf("%d KB", sizeKB)
+	}
+	mb := float64(sizeKB) / 1024.0
+	if mb < 1024 {
+		return fmt.Sprintf("%.1f MB", mb)
+	}
+	gb := mb / 1024.0
+	return fmt.Sprintf("%.2f GB", gb)
+}
+
+func makeAppCard(app *AndroidApp) fyne.CanvasObject {
+	// Build the name text – include size if available
+	nameText := app.AppName
+	if app.SizeKB > 0 {
+		nameText = fmt.Sprintf("%s  [%s]", app.AppName, formatSize(app.SizeKB))
+	}
+
+	nameLabel := widget.NewLabel(nameText)
+	nameLabel.TextStyle = fyne.TextStyle{Bold: true}
+	nameLabel.Wrapping = fyne.TextTruncate
+
+	var pkgLabel *widget.Label
+	if globalConfig.ShowPackageName {
+		pkgLabel = widget.NewLabel(app.PackageName)
+		pkgLabel.TextStyle = fyne.TextStyle{Monospace: true, Italic: true}
+		pkgLabel.Wrapping = fyne.TextTruncate
+	}
+
+	launchBtn := widget.NewButton("Launch", func() {
+		if selectedDevice == nil {
+			updateStatus("No device selected")
+			return
+		}
+		if appLauncher.IsAppRunning(selectedDevice.Serial, app.PackageName) {
+			updateStatus(fmt.Sprintf("%s is already running", app.AppName))
+			return
+		}
+		err := appLauncher.LaunchApp(selectedDevice.Serial, app.PackageName, app.AppName)
+		if err != nil {
+			updateStatus(fmt.Sprintf("Error: %v", err))
+		} else {
+			updateStatus(fmt.Sprintf("Launched: %s", app.AppName))
+		}
+	})
+	launchBtn.Importance = widget.HighImportance
+
+	bg := canvas.NewRectangle(color.RGBA{R: 40, G: 40, B: 50, A: 255})
+
+	var center fyne.CanvasObject
+	if globalConfig.ShowPackageName && pkgLabel != nil {
+		center = container.NewVBox(nameLabel, pkgLabel)
+	} else {
+		center = nameLabel
+	}
+	content := container.NewBorder(nil, nil, nil, launchBtn, center)
+
+	return container.NewPadded(container.NewStack(bg, content))
+}
+
+func makeCompactCard(app *AndroidApp) fyne.CanvasObject {
+	titleText := app.AppName
+	if app.SizeKB > 0 {
+		titleText = fmt.Sprintf("%s [%s]", app.AppName, formatSize(app.SizeKB))
+	}
+	title := widget.NewLabel(titleText)
+	title.Wrapping = fyne.TextTruncate
+	btn := widget.NewButton("Launch", func() {
+		if selectedDevice == nil {
+			updateStatus("No device selected")
+			return
+		}
+		if appLauncher.IsAppRunning(selectedDevice.Serial, app.PackageName) {
+			updateStatus(fmt.Sprintf("%s is already running", app.AppName))
+			return
+		}
+		if err := appLauncher.LaunchApp(selectedDevice.Serial, app.PackageName, app.AppName); err != nil {
+			updateStatus(fmt.Sprintf("Error: %v", err))
+		}
+	})
+	return container.NewBorder(nil, nil, nil, btn, title)
+}
+
+func makeIconItem(app *AndroidApp) fyne.CanvasObject {
+	label := app.AppName
+	if app.SizeKB > 0 {
+		label = fmt.Sprintf("%s\n%s", app.AppName, formatSize(app.SizeKB))
+	}
+	btn := widget.NewButton(label, func() {
+		if selectedDevice == nil {
+			updateStatus("No device selected")
+			return
+		}
+		if appLauncher.IsAppRunning(selectedDevice.Serial, app.PackageName) {
+			updateStatus(fmt.Sprintf("%s is already running", app.AppName))
+			return
+		}
+		if err := appLauncher.LaunchApp(selectedDevice.Serial, app.PackageName, app.AppName); err != nil {
+			updateStatus(fmt.Sprintf("Error: %v", err))
+		}
+	})
+	return btn
+}
+
+func filterApps(list []*AndroidApp, search string, hidePrefixes []string) []*AndroidApp {
+	search = strings.ToLower(strings.TrimSpace(search))
+	out := make([]*AndroidApp, 0, len(list))
+	for _, a := range list {
+		if search != "" {
+			name := strings.ToLower(a.AppName)
+			pkg := strings.ToLower(a.PackageName)
+			if !strings.Contains(name, search) && !strings.Contains(pkg, search) {
+				continue
+			}
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+func shouldHideByPrefix(pkg string, prefixes []string) bool {
+	return false
+}
+
+func joinPrefixes(p []string) string {
+	return ""
+}
+
+func parsePrefixes(s string) []string {
+	return nil
+}
+
+// lazyComputeSizes computes sizes for up to limit apps, then refreshes UI once.
+func lazyComputeSizes(serial string, list []*AndroidApp, limit int) {
+	count := 0
+	sem := make(chan struct{}, 6)
+	updated := false
+	for _, a := range list {
+		if a.SizeKB > 0 {
+			continue
+		}
+		if count >= limit {
+			break
+		}
+		count++
+		sem <- struct{}{}
+		go func(app *AndroidApp) {
+			defer func() { <-sem }()
+			if appDetector.EnsureSizeFor(serial, app) {
+				updated = true
+			}
+		}(a)
+	}
+	for i := 0; i < cap(sem); i++ {
+		sem <- struct{}{}
+	}
+	if updated {
+		fyne.Do(func() { updateAppGrid() })
+	}
+}
+
+func onDevicesChanged(newDevices []*Device) {
+	devices = newDevices
+	fyne.Do(func() {
+		if deviceList != nil {
+			deviceList.Refresh()
+		}
+	})
+}
+
+func onRunningAppsChanged(ra []*RunningApp) {
+	runningApps = ra
+	fyne.Do(func() {
+		if runningAppsList != nil {
+			runningAppsList.Refresh()
+		}
+	})
+}
+
+func updateStatus(message string) {
+	fmt.Println("[STATUS]", message)
+	fyne.Do(func() {
+		if statusLabel != nil {
+			statusLabel.SetText(message)
+		}
+	})
+}
