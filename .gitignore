@@ -40,3 +40,8 @@ build/
 
 # Dependency directories
 vendor/
+
+# Backup files
+*.bak
+*.backup
+*.old
